@@ -168,6 +168,7 @@ def get_args():
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
         {"name": "--trainRA", "action": "store_true", "default": False, "help": "testbed only: whether you want to train an RA value network"},
         {"name": "--testRA", "action": "store_true", "default": False, "help": "testbed only: whether you want to test an RA value network. You must have trained one."},
+        {"name": "--collect", "action": "store_true", "default": False},
     ]
     # parse arguments
     args = gymutil.parse_arguments(

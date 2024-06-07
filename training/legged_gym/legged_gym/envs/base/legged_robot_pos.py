@@ -52,6 +52,7 @@ class LeggedRobotPos(LeggedRobot):
     cfg : LeggedRobotPosCfg
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
+        self.force_obstacle_pos = False
 
     def _init_buffers(self):
         super()._init_buffers()
@@ -217,6 +218,10 @@ class LeggedRobotPos(LeggedRobot):
     def compute_observations(self):
         """ Computes observations
         """
+        if self.force_obstacle_pos:
+            goal2obst = torch.tensor([-1., 1.]).to('cuda')
+            self.root_states_obj[0][:, :2] = self.position_targets[:, :2] + goal2obst
+
         if self.cfg.asset.load_dynamic_object:
             for _obj in range(self.cfg.asset.object_num):
                 obj_relpos = self.root_states_obj[_obj][:, 0:3] - self.root_states[:, 0:3]

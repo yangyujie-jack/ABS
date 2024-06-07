@@ -42,6 +42,7 @@ import time
 
 RECORD_FRAMES = False
 MOVE_CAMERA = False
+RA_OBS_DIM = 5
 
 one_trial = False # if True, the robot will not reset after falling
 train_ra = False
@@ -50,7 +51,7 @@ visualize_ra = False # there can be bugs here, not encouraged to enable.
 
 
 difficulty = 2  # 0: easy; 1: medium, 2: hard
-init_obst_xy = [[-3., 8., -2.5, 2.5], [-3., 8., -2.5, 2.5], [1.5, 7., -2., 2.]]  # xmin, xmax, ymin, ymax, for easy/medium/hard
+init_obst_xy = [[-3., 8., -2.5, 2.5], [-2., 2., -2., 2.], [1.5, 7., -2., 2.]]  # xmin, xmax, ymin, ymax, for easy/medium/hard
 
 def get_pos_integral(twist, tau):
     # taylored as approximation
@@ -129,8 +130,8 @@ def play(args):
     # env_cfg.domain_rand.randomize_yaw = False
     # env_cfg.domain_rand.randomize_xy = False
     env_cfg.domain_rand.init_yaw_range = [-3.14159,3.14159]
-    env_cfg.domain_rand.init_x_range = [-0.1,0.1]
-    env_cfg.domain_rand.init_y_range = [-0.1,0.1]
+    env_cfg.domain_rand.init_x_range = [0.,0.]
+    env_cfg.domain_rand.init_y_range = [0.,0.]
     if test_ra: 
         env_cfg.domain_rand.randomize_timer_minus = 0.0
         env_cfg.asset.object_files = {'{LEGGED_GYM_ROOT_DIR}/resources/objects/cylindar.urdf': 0.415} # slightly compensate for noise
@@ -143,6 +144,7 @@ def play(args):
         print('life on easy mode')
         env_cfg.asset.object_num = 3
     if difficulty == 1:
+        env_cfg.asset.object_num = 1
         print('difficulty: normal')
     if difficulty == 2:
         print('difficulty: hard')
@@ -158,15 +160,16 @@ def play(args):
     else:
         env_cfg.asset.test_obj_pos[1:] = sample_obstacle_test(init_obst_xy[difficulty][0], init_obst_xy[difficulty][1], \
                                             init_obst_xy[difficulty][2], init_obst_xy[difficulty][3], env_cfg.env.num_envs-1, env_cfg.asset.object_num)
-    # safe init
-    env_cfg.asset.test_obj_pos[env_cfg.asset.test_obj_pos==0.] = 0.01
-    _too_near = (env_cfg.asset.test_obj_pos.norm(dim=1) < 1.1).unsqueeze(1)
-    env_cfg.asset.test_obj_pos[:,0:1,:] += _too_near * torch.sign(env_cfg.asset.test_obj_pos[:,0:1,:]) * 0.9
-    env_cfg.asset.test_obj_pos[:,1:,:] += _too_near * torch.sign(env_cfg.asset.test_obj_pos[:,1:,:]) * 0.9
+    # # safe init
+    # env_cfg.asset.test_obj_pos[env_cfg.asset.test_obj_pos==0.] = 0.01
+    # _too_near = (env_cfg.asset.test_obj_pos.norm(dim=1) < 1.1).unsqueeze(1)
+    # env_cfg.asset.test_obj_pos[:,0:1,:] += _too_near * torch.sign(env_cfg.asset.test_obj_pos[:,0:1,:]) * 0.9
+    # env_cfg.asset.test_obj_pos[:,1:,:] += _too_near * torch.sign(env_cfg.asset.test_obj_pos[:,1:,:]) * 0.9
 
     env_cfg.commands.ranges.use_polar = False
-    env_cfg.commands.ranges.pos_1 = [6.0,7.5]
-    env_cfg.commands.ranges.pos_2 = [-1.5,1.5]
+    # goal initial position
+    env_cfg.commands.ranges.pos_1 = [-2.,2.]
+    env_cfg.commands.ranges.pos_2 = [-2.,2.]
     env_cfg.commands.ranges.heading = [0.0,0.0]
 
     env_cfg.asset.terminate_after_contacts_on = ["base", 'FL_thigh', "FL_calf", "FR_thigh", "FR_calf"]
@@ -186,6 +189,7 @@ def play(args):
         env.reset_buf = torch.logical_and(env.reset_buf, _near_obj)   # filter the weird collisions from simulator that cannot be explained
         env.time_out_buf = (env.timer_left <= 0) # no terminal reward for time-outs
         env.reset_buf |= env.time_out_buf
+        env.reset_buf |= torch.norm(env.position_targets[:, :2] - env.root_states[:, :2], dim=1) < 0.3
     env.check_termination = new_check_termination
     env.debug_viz = True
     obs = env.get_observations()
@@ -202,18 +206,23 @@ def play(args):
     camera_direction = np.array(env_cfg.viewer.lookat) - np.array(env_cfg.viewer.pos)
     img_idx = 0
 
-    ra_vf = nn.Sequential(nn.Linear(19,64),nn.ReLU(),nn.Linear(64,64),nn.ReLU(),nn.Linear(64,1), nn.Tanh())
+    ra_vf = nn.Sequential(nn.Linear(RA_OBS_DIM, 32), nn.ReLU(), nn.Linear(32, 32), nn.ReLU(), nn.Linear(32, 1))
     ra_vf.to('cuda')
-    optimizer = torch.optim.SGD(ra_vf.parameters(), lr=0.002, momentum=0.0)
+    optimizer = torch.optim.Adam(ra_vf.parameters(), lr=1e-3)
+
+    nndm = nn.Sequential(
+        nn.Linear(RA_OBS_DIM, 32), nn.ReLU(),
+        nn.Linear(32, 32), nn.ReLU(),
+        nn.Linear(32, RA_OBS_DIM),
+    )
+    nndm.to('cuda')
+    nndm_optim = torch.optim.Adam(nndm.parameters(), lr=1e-3, weight_decay=1e-3)
 
     if train_ra:
         best_metric = 999.
-        path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'RA', policy_name[:-3] + '_ra' + '.pt')
-        if os.path.isfile(path):
-            _load = input('load existing value? y/n\n')
-            if _load != 'n':
-                ra_vf = torch.load(path)
-                print('loaded value from', path)
+        min_nndm_loss = np.inf
+        path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported')
+        os.makedirs(path, exist_ok=True)
     if test_ra:
         path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'RA')
         RA_name = policy_name[:-3] + '_ra' + '.pt'
@@ -223,10 +232,10 @@ def play(args):
         rec_policy = torch.jit.load(rec_policy_path).cuda()
         print('loaded recovery policy from',rec_policy_path)
         mode_running = True # if False: recovery
-        
-    standard_raobs_init = torch.Tensor([[0,0,0,0,0,0,6.,0]+[0.,0.,0.,1.,1.,2.,2.,1.,0.,0.,0.]]).to(env.device)
-    standard_raobs_die = torch.Tensor([[5.,0,0,0,0,0,6.,0]+[-2.5]*11]).to(env.device)
-    standard_raobs_turn = torch.Tensor([[0,0,0,0,0,2.0, 0.5,5.8]+[2.0]*6+[0.0]*5]).to(env.device)
+
+    standard_raobs_init = torch.Tensor([[0.,2.,0.,1.,0.]]).to(env.device)
+    standard_raobs_die  = torch.Tensor([[1.,2.,0.,0.2,0.]]).to(env.device)
+    standard_raobs_turn = torch.Tensor([[0.,2.,0.,1.,0.]]).to(env.device)
     ra_obs = standard_raobs_init.clone().repeat(env.num_envs,1)
 
     collision = torch.zeros(env.num_envs).to(env.device).bool()
@@ -234,7 +243,7 @@ def play(args):
     queue_len = 1001
     batch_size = 200
     hindsight = 10
-    s_queue = torch.zeros((queue_len,env.num_envs,19), device = env.device, dtype=torch.float)
+    s_queue = torch.zeros((queue_len,env.num_envs, RA_OBS_DIM), device = env.device, dtype=torch.float)
     g_queue = torch.zeros((queue_len,env.num_envs), device = env.device, dtype=torch.float)
     g_hs_queue = g_queue.clone()
     g_hs_span = torch.zeros((2,env.num_envs), device = env.device, dtype=torch.int) # start and end index of the latest finished episode
@@ -243,7 +252,10 @@ def play(args):
 
     alive = torch.ones_like(env.reset_buf)
 
-
+    if args.collect:
+        data_queue_len = 1000
+        obs_data_queue = torch.empty((data_queue_len, env.num_envs, RA_OBS_DIM), device=env.device, dtype=torch.float32)
+        done_data_queue = torch.empty((data_queue_len, env.num_envs), device=env.device, dtype=torch.bool)
 
     # ======= metrics begin =======
     total_n_collision, total_n_reach, total_n_timeout = 0, 0, 0
@@ -285,19 +297,20 @@ def play(args):
     total_timeout_time = 0
     # ======= metrics end =======
 
-    
-    for i in range(300*int(env.max_episode_length)):
+    for i in range(20*int(env.max_episode_length)):  # env.max_episode_length = 451
+        if args.collect and i % 100 == 0:
+            print(f"i = {i}")
         current_recovery_status = torch.zeros(env.num_envs).to(env.device).bool()
         where_recovery = torch.zeros(env.num_envs).to(env.device).bool()
         if i% 1000==0 and train_ra:
             # resample the obstacles
             env.cfg.asset.test_obj_pos[:,0,:] = env.cfg.asset.test_obj_pos[:,0,:].uniform_(init_obst_xy[difficulty][0],init_obst_xy[difficulty][1])
             env.cfg.asset.test_obj_pos[:,1,:] = env.cfg.asset.test_obj_pos[:,1,:].uniform_(init_obst_xy[difficulty][2],init_obst_xy[difficulty][3])
-            # safe init
-            env.cfg.asset.test_obj_pos[env_cfg.asset.test_obj_pos==0.] = 0.01
-            _too_near = (env.cfg.asset.test_obj_pos[:].norm(dim=1) < 1.1).unsqueeze(1)
-            env.cfg.asset.test_obj_pos[:,0:1,:] += _too_near * torch.sign(env.cfg.asset.test_obj_pos[:,0:1,:]) * 0.9
-            env.cfg.asset.test_obj_pos[:,1:,:] += _too_near * torch.sign(env.cfg.asset.test_obj_pos[:,1:,:]) * 0.9
+            # # safe init
+            # env.cfg.asset.test_obj_pos[env_cfg.asset.test_obj_pos==0.] = 0.01
+            # _too_near = (env.cfg.asset.test_obj_pos[:].norm(dim=1) < 1.1).unsqueeze(1)
+            # env.cfg.asset.test_obj_pos[:,0:1,:] += _too_near * torch.sign(env.cfg.asset.test_obj_pos[:,0:1,:]) * 0.9
+            # env.cfg.asset.test_obj_pos[:,1:,:] += _too_near * torch.sign(env.cfg.asset.test_obj_pos[:,1:,:]) * 0.9
 
         if env.do_reset and (not train_ra):
             env_cfg.asset.test_obj_pos[:] = sample_obstacle_test(init_obst_xy[difficulty][0], init_obst_xy[difficulty][1], \
@@ -451,7 +464,7 @@ def play(args):
             avg_total_dist = total_travel_dist / (total_episode + 1e-8)
             avg_total_time = total_time / (total_episode + 1e-8)
 
-            avg_total_velocity = avg_total_dist / avg_total_time
+            avg_total_velocity = avg_total_dist / (avg_total_time + 1e-8)
             avg_collision_velocity = avg_collision_dist / (avg_collision_time + 1e-8)
             avg_reach_velocity = avg_reach_dist / (avg_reach_time + 1e-8)
             avg_timeout_velocity = avg_timeout_dist / (avg_timeout_time + 1e-8)
@@ -495,9 +508,30 @@ def play(args):
         # contact_forces refresh is before done-reset-obs so it is at "t-1"
         if one_trial: alive = torch.logical_and(alive, ~collision)
 
-        ra_obs = torch.cat([env.base_lin_vel, env.base_ang_vel, obs[:,10:12], obs[:,-len(env.ray2d_obs[0]):]], dim=-1)
+        v = env.base_lin_vel[:, :1]  # robot longitudinal velocity
+        goal_xy = obs[:, 10:12]  # goal relative xy position
+        obst_xy = env.obj_relpos[0][:, :2]  # obstacle relative xy position
+        ra_obs = torch.cat((v, goal_xy, obst_xy), dim=1)
 
-        if train_ra:
+        if args.collect:
+            obs_data_queue[i] = ra_obs.clone()
+            done_data_queue[i] = dones.clone()
+            if i == data_queue_len - 1:
+                data_queue = obs_data_queue.cpu().numpy()
+                data_queue = data_queue.transpose(1, 0, 2).reshape(-1, RA_OBS_DIM)
+                mask = done_data_queue.cpu().numpy()
+                mask[:-1] = mask[1:]
+                mask[-1] = True
+                mask = mask.transpose(1, 0).reshape(-1)
+                x = data_queue[~mask]
+                mask[1:] = mask[:-1]
+                mask[0] = True
+                x_prime = data_queue[~mask]
+                print(f'Saving {x.shape[0]} data samples!')
+                np.savez(os.path.join(path, 'data.npz'), x=x, x_prime=x_prime)
+                return
+
+        if train_ra and not args.collect:
             ## ls <=0: reach target; gs >0: failure
             gs = collision.float() * 2 - 1  # 1 for collision, -1 for not collision
             ls = torch.tanh( torch.log2(torch.norm(obs[:,10:12], dim=-1) / 0.65 + 1e-8) )
@@ -529,6 +563,7 @@ def play(args):
             
             if i > queue_len and i % 20 == 0:
                 false_safe, false_reach, n_fail, n_reach, accu_loss = 0, 0, 0, 0, []
+                nndm_losses = []
                 total_n_fail, total_n_reach = torch.logical_and(g_queue[1:]>0, done_queue[1:]).sum().item(), torch.logical_and(l_queue[:-1]<=0,done_queue[1:]).sum().item()
                 start_v = ra_vf(standard_raobs_init).mean().item()
                 die_v = ra_vf(standard_raobs_die).mean().item() 
@@ -548,26 +583,40 @@ def play(args):
                     torch.nn.utils.clip_grad_norm_(ra_vf.parameters(), 1.0)
                     optimizer.step()
 
+                    old = slice(_start, _start + batch_size)
+                    new = slice(_start + 1, _start + batch_size + 1)
+                    s_old = s_queue[old]
+                    s_new = s_queue[new]
+                    d_new = done_queue[new]
+                    nndm_loss = (~d_new.unsqueeze(-1) * (nndm(s_old) - (s_new - s_old)) ** 2).mean()
+                    nndm_optim.zero_grad()
+                    nndm_loss.backward()
+                    nndm_optim.step()
+
                     false_safe += torch.logical_and(g_queue[_start+1:_start+batch_size+1]>0 , vs_old<=0).sum().item()
                     false_reach += torch.logical_and(l_queue[_start:_start+batch_size]<=0 , vs_old>0).sum().item()
                     n_fail += (g_queue[_start+1:_start+batch_size+1]>0).sum().item()
                     n_reach += (l_queue[_start:_start+batch_size]<=0).sum().item() 
                     accu_loss.append(v_loss.item())
+                    nndm_losses.append(nndm_loss.item())
 
                 new_loss = np.mean(accu_loss)
+                mean_nndm_loss = np.mean(nndm_losses)
                 print('value RA loss %.4f, false safe rate %.2f in %d, false reach rate %.2f in %d, standard values init %.2f die %.2f turn %.2f, step %d'%\
                                 (new_loss, false_safe/(n_fail+1e-8), n_fail, false_reach/(n_reach+1e-8), n_reach, start_v, die_v, turn_v, i), end='   \n')
-                
-                if false_safe/(n_fail+1e-8) < best_metric and die_v > 0.2 and start_v<-0.1 and turn_v<-0.1 and i > 3000:
+                print('NNDM loss %.4f' % mean_nndm_loss)
+
+                if false_safe/(n_fail+1e-8) < best_metric and die_v > 0.1 and start_v<-0.1 and turn_v<-0.1 and i > 3000:
                     best_metric = false_safe/(n_fail+1e-8)
-                    path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'RA')
-                    try:
-                        os.mkdir(path)
-                    except:
-                        pass
                     RA_name = policy_name[:-3] + '_ra' + '.pt'
                     torch.save(ra_vf, os.path.join(path, RA_name))
                     print('\x1b[6;30;42m', 'saving ra model to', os.path.join(path, RA_name), '\x1b[0m' )
+
+                if mean_nndm_loss < min_nndm_loss and i > 3000:
+                    min_nndm_loss = mean_nndm_loss
+                    nndm_name = policy_name[:-3] + '_nndm' + '.pt'
+                    torch.save(nndm, os.path.join(path, nndm_name))
+                    print('\x1b[6;30;42m', 'saving nndm to', os.path.join(path, nndm_name), '\x1b[0m')
 
         if RECORD_FRAMES:
             if i % 2:
@@ -580,4 +629,8 @@ def play(args):
 
 if __name__ == '__main__':
     args = get_args()
+    args.task = 'go1_pos_rough'
+    args.load_run = '05_13_20-29-06_'
+    args.num_envs = 1000
+    args.headless = True
     play(args)
