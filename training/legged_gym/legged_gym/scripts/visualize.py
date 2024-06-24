@@ -162,7 +162,7 @@ def visualize_trajectory(repaired: bool = False):
     c_obst = mpl.colors.hsv_to_rgb(hsl_to_hsv(0, 0.7, 0.85))
     obst = Circle((0, 0), 0.4, color=c_obst)
     ax.add_patch(obst)
-    c_goal = mpl.colors.hsv_to_rgb(hsl_to_hsv(110 / 360, 0.6, 0.8))
+    c_goal = mpl.colors.hsv_to_rgb(hsl_to_hsv(120 / 360, 0.5, 0.8))
     goal = Circle((1, -1), 0.6, color=c_goal)
     ax.add_patch(goal)
 
@@ -308,8 +308,8 @@ if __name__ == '__main__':
     # args.seed = 1
     # collect_trajectory(args)
 
-    # visualize_trajectory(repaired=False)
+    visualize_trajectory(repaired=True)
 
-    visualize_value_function(repaired=True)
+    # visualize_value_function(repaired=True)
 
     # visualize_obs_trajectory()
