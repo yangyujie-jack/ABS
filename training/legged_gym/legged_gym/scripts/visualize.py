@@ -9,10 +9,17 @@ from legged_gym.utils import get_args, task_registry
 import torch
 import torch.nn as nn
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import onnx
 from onnx2pytorch import ConvertModel
+
+
+def hsl_to_hsv(h, s, l):
+    v = l + s * min(l, 1-l)
+    s = 0 if v == 0 else 2 * (1 - l / v)
+    return h, s, v
 
 
 def observation_distribution():
@@ -137,8 +144,9 @@ def visualize_trajectory(repaired: bool = False):
     dist = np.linalg.norm(pos, axis=2)
     infe = (v <= 0) & np.any(dist < 0.4, axis=0)
     print("Infeasible trajectory num:", np.sum(infe))
-    pos = pos[:, infe]
-    ra_obs = ra_obs[:, infe]
+    i = np.argmin(v[infe])
+    pos = pos[:, infe][:, i:i + 1]
+    ra_obs = ra_obs[:, infe][:, i:i + 1]
 
     # downsampling
     pos = pos[:, :min(pos.shape[1], 10)]
@@ -149,11 +157,13 @@ def visualize_trajectory(repaired: bool = False):
         v = value(torch.from_numpy(ra_obs).to('cuda')).squeeze(2).cpu().numpy()
 
     # visualize trajectory
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(4.5, 4))
 
-    obst = Circle((0, 0), 0.4, color='r', alpha=0.3)
+    c_obst = mpl.colors.hsv_to_rgb(hsl_to_hsv(0, 0.7, 0.85))
+    obst = Circle((0, 0), 0.4, color=c_obst)
     ax.add_patch(obst)
-    goal = Circle((1, -1), 0.6, color='g', alpha=0.3)
+    c_goal = mpl.colors.hsv_to_rgb(hsl_to_hsv(110 / 360, 0.6, 0.8))
+    goal = Circle((1, -1), 0.6, color=c_goal)
     ax.add_patch(goal)
 
     dist = np.linalg.norm(pos, axis=2)
@@ -170,13 +180,18 @@ def visualize_trajectory(repaired: bool = False):
     v_max += (v_max - v_min) * 0.01
     print(f'v_min: {v_min}, v_max: {v_max}')
 
-    for pp, pv in zip(pre_pos, pre_v):
-        s = ax.scatter(pp[:, 0], pp[:, 1], c=pv, vmin=v_min, vmax=v_max)
-    cb = fig.colorbar(s, ax=ax)
+    colors = [mpl.colors.hsv_to_rgb(hsl_to_hsv(180 / 360, 0.4, i))
+              for i in np.linspace(0.8, 0.3, 10)]
+    cmap = mpl.colors.ListedColormap(colors)
 
+    for pp, pv in zip(pre_pos, pre_v):
+        s = ax.scatter(pp[:, 0], pp[:, 1], c=pv, cmap=cmap, vmin=v_min, vmax=v_max)
+    cb = fig.colorbar(s, ax=ax, fraction=0.046, pad=0.04)
+
+    c_contour = mpl.colors.hsv_to_rgb(hsl_to_hsv(0, 1, 0.5))
     for i in range(pos.shape[1]):
-        ax.add_patch(Circle(pos[0, i], 0.022, color='r', fill=False))
-        cb.ax.plot([0, 1], [v[0, i], v[0, i]], c='r')
+        ax.add_patch(Circle(pos[0, i], 0.029, color=c_contour, fill=False))
+        cb.ax.plot([0, 1], [v[0, i], v[0, i]], c=c_contour)
 
     ax.set_xlabel('x')
     ax.set_ylabel('y')
@@ -187,9 +202,9 @@ def visualize_trajectory(repaired: bool = False):
 
     # save figure
     if repaired:
-        plt.savefig(os.path.join(path, f'trajectory_repaired.png'), dpi=300)
+        plt.savefig(os.path.join(path, f'trajectory_repaired.pdf'), dpi=300)
     else:
-        plt.savefig(os.path.join(path, f'trajectory.png'), dpi=300)
+        plt.savefig(os.path.join(path, f'trajectory.pdf'), dpi=300)
     plt.close()
 
 
@@ -225,14 +240,18 @@ def visualize_value_function(repaired: bool = False):
     with torch.no_grad():
         vm = value(torch.from_numpy(ra_obs).float().to('cuda')).squeeze(2).cpu().numpy()
 
-    fig, ax = plt.subplots()
-    cf = ax.contourf(xm, ym, vm)
-    obst = Circle((0, 0), 0.4, color='k', fill=False)
+    fig, ax = plt.subplots(figsize=(4.5, 4))
+    colors = [mpl.colors.hsv_to_rgb(hsl_to_hsv(180 / 360, 0.4, i))
+              for i in np.linspace(0.9, 0.1, 10)]
+    cmap = mpl.colors.ListedColormap(colors)
+    cf = ax.contourf(xm, ym, vm, cmap=cmap)
+    obst = Circle((0, 0), 0.4, color='w', fill=False)
     ax.add_patch(obst)
     goal = Circle((1, -1), 0.6, color='k', fill=False)
     ax.add_patch(goal)
-    zero = ax.contour(cf, levels=[0], colors='r')
-    cb = fig.colorbar(cf)
+    c_contour = mpl.colors.hsv_to_rgb(hsl_to_hsv(0, 0.7, 0.6))
+    zero = ax.contour(cf, levels=[0], colors=np.append(c_contour, 1).reshape(-1, 4))
+    cb = fig.colorbar(cf, fraction=0.046, pad=0.04)
     cb.add_lines(zero)
     ax.set_xlabel('x')
     ax.set_ylabel('y')
@@ -244,9 +263,9 @@ def visualize_value_function(repaired: bool = False):
     path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', 'go1_pos_rough', 'visualize')
     os.makedirs(path, exist_ok=True)
     if repaired:
-        plt.savefig(os.path.join(path, f'heatmap_repaired.png'), dpi=300)
+        plt.savefig(os.path.join(path, f'heatmap_repaired.pdf'), dpi=300)
     else:
-        plt.savefig(os.path.join(path, f'heatmap.png'), dpi=300)
+        plt.savefig(os.path.join(path, f'heatmap.pdf'), dpi=300)
     plt.close()
 
 
@@ -289,8 +308,8 @@ if __name__ == '__main__':
     # args.seed = 1
     # collect_trajectory(args)
 
-    visualize_trajectory(repaired=False)
+    # visualize_trajectory(repaired=False)
 
-    # visualize_value_function(repaired=True)
+    visualize_value_function(repaired=True)
 
     # visualize_obs_trajectory()
