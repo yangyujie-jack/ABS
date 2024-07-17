@@ -11,7 +11,7 @@ import torch.nn as nn
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Rectangle
 import onnx
 from onnx2pytorch import ConvertModel
 
@@ -29,7 +29,7 @@ def observation_distribution():
     for i in range(obs.shape[1]):
         plt.figure()
         plt.hist(obs[:, i], bins=50)
-        plt.savefig(os.path.join(path, f'ra_obs_{i}.png'))
+        plt.savefig(os.path.join(path, f'ra_obs_{i}.pdf'))
         plt.close()
 
 
@@ -130,6 +130,36 @@ def collect_trajectory(args, traj_len: int = 200):
     np.savez(os.path.join(path, 'traj.npz'), **traj)
 
 
+def load_value_function(repaired: bool = False):
+    path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', 'go1_pos_rough', 'exported')
+    if repaired:
+        onnx_model = onnx.load(os.path.join(path, 'value_repair.onnx'))
+        value = ConvertModel(onnx_model, experimental=True)
+        value.to('cuda')
+    else:
+        value = torch.load(os.path.join(path, '05_13_20-29-06_model_4000_ra.pt'))
+    return value
+
+
+def get_ra_obs():
+    x = np.linspace(-1, 1, 100)
+    y = np.linspace(-1, 1, 100)
+    xm, ym = np.meshgrid(x, y)
+    th = np.pi / 4
+    rot_mat = np.stack((
+        np.array((np.cos(th), -np.sin(th))),
+        np.array((np.sin(th), np.cos(th)))),
+    )
+    goal_xy = (rot_mat @ np.stack((1 - xm, -1 - ym), axis=2)[..., np.newaxis])[..., 0]
+    obst_xy = (rot_mat @ np.stack((-xm, -ym), axis=2)[..., np.newaxis])[..., 0]
+    ra_obs = np.concatenate((
+        np.ones_like(xm)[..., np.newaxis],
+        goal_xy,
+        obst_xy,
+    ), axis=2)
+    return xm, ym, ra_obs
+
+
 def visualize_trajectory(repaired: bool = False):
     # load trajectory
     path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', 'go1_pos_rough', 'visualize')
@@ -145,19 +175,28 @@ def visualize_trajectory(repaired: bool = False):
     infe = (v <= 0) & np.any(dist < 0.4, axis=0)
     print("Infeasible trajectory num:", np.sum(infe))
     i = np.argmin(v[infe])
-    pos = pos[:, infe][:, i:i + 1]
-    ra_obs = ra_obs[:, infe][:, i:i + 1]
+    pos = pos[:, infe][:, i]  # (T, 2)
+    ra_obs = ra_obs[:, infe][:, i]  # (T, 5)
 
     # downsampling
-    pos = pos[:, :min(pos.shape[1], 10)]
-    ra_obs = ra_obs[:, :min(ra_obs.shape[1], 10)]
     if repaired:
         value = load_value_function(repaired=True)
     with torch.no_grad():
-        v = value(torch.from_numpy(ra_obs).to('cuda')).squeeze(2).cpu().numpy()
+        v = value(torch.from_numpy(ra_obs).to('cuda')).squeeze(1).cpu().numpy()  # (T,)
 
     # visualize trajectory
     fig, ax = plt.subplots(figsize=(4.5, 4))
+
+    # for colorbar range
+    xm, ym, obs = get_ra_obs()
+    with torch.no_grad():
+        vm = value(torch.from_numpy(obs).float().to('cuda')).squeeze(2).cpu().numpy()
+    colors = [mpl.colors.hsv_to_rgb(hsl_to_hsv(180 / 360, 0.4, i))
+              for i in np.linspace(0.9, 0.1, 9)]
+    cmap = mpl.colors.ListedColormap(colors)
+    cf = ax.contourf(xm, ym, vm, cmap=cmap)
+    cb = fig.colorbar(cf, ax=ax, fraction=0.046, pad=0.04)
+    ax.add_patch(Rectangle((-1, -1), 2, 2, color='w'))
 
     c_obst = mpl.colors.hsv_to_rgb(hsl_to_hsv(0, 0.7, 0.85))
     obst = Circle((0, 0), 0.4, color=c_obst)
@@ -166,32 +205,20 @@ def visualize_trajectory(repaired: bool = False):
     goal = Circle((1, -1), 0.6, color=c_goal)
     ax.add_patch(goal)
 
-    dist = np.linalg.norm(pos, axis=2)
-    pre_pos = []
-    pre_v = []
-    v_min, v_max = np.inf, -np.inf
-    for i in range(pos.shape[1]):
-        t = np.argmax(dist[:, i] < 0.4) + 2
-        pre_pos.append(pos[:t, i])
-        pre_v.append(v[:t, i])
-        v_min = min(v_min, v[:t, i].min())
-        v_max = max(v_max, v[:t, i].max())
-    v_min -= (v_max - v_min) * 0.01
-    v_max += (v_max - v_min) * 0.01
-    print(f'v_min: {v_min}, v_max: {v_max}')
-
-    colors = [mpl.colors.hsv_to_rgb(hsl_to_hsv(180 / 360, 0.4, i))
-              for i in np.linspace(0.8, 0.3, 10)]
-    cmap = mpl.colors.ListedColormap(colors)
-
-    for pp, pv in zip(pre_pos, pre_v):
-        s = ax.scatter(pp[:, 0], pp[:, 1], c=pv, cmap=cmap, vmin=v_min, vmax=v_max)
-    cb = fig.colorbar(s, ax=ax, fraction=0.046, pad=0.04)
+    dist = np.linalg.norm(pos, axis=1)  # (T,)
+    t = np.argmax(dist < 0.4) + 2
+    pre_pos = pos[:t]  # (T, 2)
+    pre_v = v[:t]  # (T,)
+    cb_ticks = cb.get_ticks()
+    c = []
+    for pre_v_i in pre_v:
+        c_idx = np.where(cb_ticks > pre_v_i)[0][0] - 1
+        c.append(colors[c_idx])
+    ax.scatter(pre_pos[:, 0], pre_pos[:, 1], c=c)
 
     c_contour = mpl.colors.hsv_to_rgb(hsl_to_hsv(0, 1, 0.5))
-    for i in range(pos.shape[1]):
-        ax.add_patch(Circle(pos[0, i], 0.029, color=c_contour, fill=False))
-        cb.ax.plot([0, 1], [v[0, i], v[0, i]], c=c_contour)
+    ax.add_patch(Circle(pos[0], 0.029, color=c_contour, fill=False))
+    cb.ax.plot([0, 1], [v[0], v[0]], c=c_contour)
 
     ax.set_xlabel('x')
     ax.set_ylabel('y')
@@ -208,35 +235,9 @@ def visualize_trajectory(repaired: bool = False):
     plt.close()
 
 
-def load_value_function(repaired: bool = False):
-    path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', 'go1_pos_rough', 'exported')
-    if repaired:
-        onnx_model = onnx.load(os.path.join(path, 'value_repair.onnx'))
-        value = ConvertModel(onnx_model, experimental=True)
-        value.to('cuda')
-    else:
-        value = torch.load(os.path.join(path, '05_13_20-29-06_model_4000_ra.pt'))
-    return value
-
-
 def visualize_value_function(repaired: bool = False):
-    x = np.linspace(-1, 1, 100)
-    y = np.linspace(-1, 1, 100)
-    xm, ym = np.meshgrid(x, y)
-    th = np.pi / 4
-    rot_mat = np.stack((
-        np.array((np.cos(th), -np.sin(th))),
-        np.array((np.sin(th), np.cos(th)))),
-    )
-    goal_xy = (rot_mat @ np.stack((1 - xm, -1 - ym), axis=2)[..., np.newaxis])[..., 0]
-    obst_xy = (rot_mat @ np.stack((-xm, -ym), axis=2)[..., np.newaxis])[..., 0]
-    ra_obs = np.concatenate((
-        np.ones_like(xm)[..., np.newaxis],
-        goal_xy,
-        obst_xy,
-    ), axis=2)
-
     value = load_value_function(repaired=repaired)
+    xm, ym, ra_obs = get_ra_obs()
     with torch.no_grad():
         vm = value(torch.from_numpy(ra_obs).float().to('cuda')).squeeze(2).cpu().numpy()
 
@@ -293,7 +294,7 @@ def visualize_obs_trajectory():
         ax.set_xlabel('Time step')
         ax.set_ylabel(f'Obs_{i}')
         plt.tight_layout()
-        plt.savefig(os.path.join(path, 'visualize', f'obs_traj_{i}.png'), dpi=300)
+        plt.savefig(os.path.join(path, 'visualize', f'obs_traj_{i}.pdf'), dpi=300)
         plt.close()
 
 
@@ -308,8 +309,7 @@ if __name__ == '__main__':
     # args.seed = 1
     # collect_trajectory(args)
 
-    visualize_trajectory(repaired=True)
-
     # visualize_value_function(repaired=True)
+    visualize_trajectory(repaired=True)
 
     # visualize_obs_trajectory()
